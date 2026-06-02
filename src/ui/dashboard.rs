@@ -1,5 +1,5 @@
 use crate::models::{Priority, Record, RecordType, TaskStatus};
-use crate::store::{DashboardData, StatsData, Store};
+use crate::store::{DashboardData, StatsData, Store, StoreEvent};
 use crate::ui::record_detail_sidebar::{RecordDetailSidebar, SavePayload as RecordSavePayload};
 use crate::ui::task_detail_sidebar::{SavePayload as TaskSavePayload, TaskDetailSidebar};
 use crate::ui::task_panel::TaskFocusPreset;
@@ -116,7 +116,8 @@ impl Dashboard {
             });
         });
 
-        dashboard.load_data(cx);
+        dashboard.install_data_change_listener(cx);
+        dashboard.refresh_data(cx);
         dashboard
     }
 
@@ -125,6 +126,31 @@ impl Dashboard {
         F: Fn(DashboardAction, &mut Window, &mut Context<Self>) + Send + Sync + 'static,
     {
         self.on_action = Some(Box::new(callback));
+    }
+
+    pub fn refresh_data(&mut self, cx: &mut Context<Self>) {
+        self.load_data(cx);
+    }
+
+    fn install_data_change_listener(&mut self, cx: &mut Context<Self>) {
+        let mut changes = self.store.subscribe_data_changes();
+        cx.spawn(async move |view, cx| loop {
+            match changes.recv().await {
+                Ok(StoreEvent::DataChanged)
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if view
+                        .update(cx, |this, cx| {
+                            this.refresh_data(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        })
+        .detach();
     }
 
     fn load_data(&mut self, cx: &mut Context<Self>) {

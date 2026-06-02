@@ -1,5 +1,5 @@
 use crate::models::{LineGraphData, LineOverview, Record, RecordType, TaskStatus};
-use crate::store::Store;
+use crate::store::{Store, StoreEvent};
 use crate::ui::record_detail_sidebar::{RecordDetailSidebar, SavePayload as RecordSavePayload};
 use crate::ui::task_detail_sidebar::{SavePayload as TaskSavePayload, TaskDetailSidebar};
 use crate::ui::tokenized_text::{
@@ -72,8 +72,30 @@ impl Timeline {
         };
 
         panel.install_sidebar_handlers(cx);
+        panel.install_data_change_listener(cx);
         panel.load_graph(cx);
         panel
+    }
+
+    fn install_data_change_listener(&mut self, cx: &mut Context<Self>) {
+        let mut changes = self.store.subscribe_data_changes();
+        cx.spawn(async move |view, cx| loop {
+            match changes.recv().await {
+                Ok(StoreEvent::DataChanged)
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if view
+                        .update(cx, |panel, cx| {
+                            panel.refresh_data(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        })
+        .detach();
     }
 
     fn install_sidebar_handlers(&mut self, cx: &mut Context<Self>) {
@@ -132,7 +154,7 @@ impl Timeline {
         });
     }
 
-    fn refresh_data(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_data(&mut self, cx: &mut Context<Self>) {
         self.request_generation += 1;
         self.load_graph(cx);
     }

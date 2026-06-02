@@ -20,6 +20,7 @@ use crate::settings::{load_app_settings, save_app_settings};
 use async_channel::{unbounded, Receiver, Sender};
 use chrono::{DateTime, Duration, Local};
 use std::path::PathBuf;
+use tokio::sync::broadcast;
 
 #[derive(Clone, Debug)]
 pub struct DashboardData {
@@ -65,7 +66,15 @@ pub struct GitRemoteSyncPullPreview {
 #[derive(Clone)]
 pub struct Store {
     sender: Sender<StoreCommand>,
+    event_sender: broadcast::Sender<StoreEvent>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreEvent {
+    DataChanged,
+}
+
+pub type StoreEventReceiver = broadcast::Receiver<StoreEvent>;
 
 pub enum StoreCommand {
     GetTasks {
@@ -271,6 +280,7 @@ pub enum StoreCommand {
 
 pub struct StoreRuntime {
     receiver: Receiver<StoreCommand>,
+    event_sender: broadcast::Sender<StoreEvent>,
     db: Option<Database>,
     db_path: Option<PathBuf>,
 }
@@ -363,11 +373,32 @@ fn derive_task_stats(tasks: &[Record], now: DateTime<Local>) -> DerivedTaskStats
 }
 
 impl StoreRuntime {
-    pub fn new(receiver: Receiver<StoreCommand>) -> Self {
+    pub fn new(
+        receiver: Receiver<StoreCommand>,
+        event_sender: broadcast::Sender<StoreEvent>,
+    ) -> Self {
         Self {
             receiver,
+            event_sender,
             db: None,
             db_path: None,
+        }
+    }
+
+    fn publish_data_changed(&self) {
+        let _ = self.event_sender.send(StoreEvent::DataChanged);
+    }
+
+    async fn send_result<T>(
+        &self,
+        respond_to: Sender<Result<T, String>>,
+        result: Result<T, String>,
+        publish_on_success: bool,
+    ) {
+        let should_publish = publish_on_success && result.is_ok();
+        let _ = respond_to.send(result).await;
+        if should_publish {
+            self.publish_data_changed();
         }
     }
 
@@ -458,7 +489,7 @@ impl StoreRuntime {
                 }
                 StoreCommand::CreateRecord { record, respond_to } => {
                     let result = self.handle_create_record(record).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::CreateRecordWithLine {
                     record,
@@ -466,11 +497,11 @@ impl StoreRuntime {
                     respond_to,
                 } => {
                     let result = self.handle_create_record_with_line(record, line_ref).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::UpdateRecord { record, respond_to } => {
                     let result = self.handle_update_record(record).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::UpdateRecordWithLine {
                     record,
@@ -478,11 +509,11 @@ impl StoreRuntime {
                     respond_to,
                 } => {
                     let result = self.handle_update_record_with_line(record, line_ref).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::DeleteRecord { id, respond_to } => {
                     let result = self.handle_delete_record(id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::GetTimeline { query, respond_to } => {
                     let result = self.handle_get_timeline(query).await;
@@ -504,14 +535,14 @@ impl StoreRuntime {
                     respond_to,
                 } => {
                     let result = self.handle_complete_line(line_id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::DeleteLine {
                     line_id,
                     respond_to,
                 } => {
                     let result = self.handle_delete_line(line_id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::GetOrCreateLine {
                     line_ref,
@@ -550,11 +581,11 @@ impl StoreRuntime {
                 }
                 StoreCommand::StartTask { id, respond_to } => {
                     let result = self.handle_start_task(id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::CompleteTask { id, respond_to } => {
                     let result = self.handle_complete_task(id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::CancelTask {
                     id,
@@ -562,11 +593,11 @@ impl StoreRuntime {
                     respond_to,
                 } => {
                     let result = self.handle_cancel_task(id, reason).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::ReopenTask { id, respond_to } => {
                     let result = self.handle_reopen_task(id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::GetAllTags { respond_to } => {
                     let result = self.handle_get_all_tags().await;
@@ -578,7 +609,7 @@ impl StoreRuntime {
                 }
                 StoreCommand::CreateTag { name, respond_to } => {
                     let result = self.handle_create_tag(name).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::AddTagToRecord {
                     record_id,
@@ -586,7 +617,7 @@ impl StoreRuntime {
                     respond_to,
                 } => {
                     let result = self.handle_add_tag_to_record(record_id, tag_id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::GetAllPersons { respond_to } => {
                     let result = self.handle_get_all_persons().await;
@@ -598,7 +629,7 @@ impl StoreRuntime {
                 }
                 StoreCommand::CreatePerson { name, respond_to } => {
                     let result = self.handle_create_person(name).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::AddPersonToRecord {
                     record_id,
@@ -606,7 +637,7 @@ impl StoreRuntime {
                     respond_to,
                 } => {
                     let result = self.handle_add_person_to_record(record_id, person_id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::GetAttachments {
                     record_id,
@@ -620,7 +651,7 @@ impl StoreRuntime {
                     respond_to,
                 } => {
                     let result = self.handle_import_image_attachments(prepared).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::CreateAttachmentPlaceholders {
                     attachments,
@@ -629,11 +660,13 @@ impl StoreRuntime {
                     let result = self
                         .handle_create_attachment_placeholders(attachments)
                         .await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::MarkAttachmentReady { prepared } => {
                     if let Err(err) = self.handle_mark_attachment_ready(prepared).await {
                         eprintln!("[Store] Failed to mark attachment ready: {}", err);
+                    } else {
+                        self.publish_data_changed();
                     }
                 }
                 StoreCommand::MarkAttachmentFailed {
@@ -645,6 +678,8 @@ impl StoreRuntime {
                         .await
                     {
                         eprintln!("[Store] Failed to mark attachment failed: {}", err);
+                    } else {
+                        self.publish_data_changed();
                     }
                 }
                 StoreCommand::GetAttachmentBytes {
@@ -659,7 +694,7 @@ impl StoreRuntime {
                     respond_to,
                 } => {
                     let result = self.handle_delete_attachment(attachment_id).await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::GetStorageUsageSummary { respond_to } => {
                     let result = self.handle_get_storage_usage_summary().await;
@@ -696,7 +731,7 @@ impl StoreRuntime {
                     let result = self
                         .handle_apply_import(archive_path, mode, resolutions)
                         .await;
-                    let _ = respond_to.send(result).await;
+                    self.send_result(respond_to, result, true).await;
                 }
                 StoreCommand::GetGitRemoteSyncConfig { respond_to } => {
                     let result = self.handle_get_git_remote_sync_config().await;
@@ -1559,12 +1594,20 @@ fn write_temp_git_remote_snapshot_archive(bytes: &[u8]) -> Result<PathBuf, Strin
 
 pub fn create_store() -> (Store, StoreRuntime) {
     let (sender, receiver) = unbounded();
-    let store = Store { sender };
-    let runtime = StoreRuntime::new(receiver);
+    let (event_sender, _) = broadcast::channel(64);
+    let store = Store {
+        sender,
+        event_sender: event_sender.clone(),
+    };
+    let runtime = StoreRuntime::new(receiver, event_sender);
     (store, runtime)
 }
 
 impl Store {
+    pub fn subscribe_data_changes(&self) -> StoreEventReceiver {
+        self.event_sender.subscribe()
+    }
+
     pub async fn get_tasks(&self) -> Result<Vec<Record>, String> {
         eprintln!("[Store] get_tasks called");
         let (tx, rx) = async_channel::unbounded();

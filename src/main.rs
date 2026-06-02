@@ -5,8 +5,8 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::Disableable;
-use gpui_component::{h_flex, ActiveTheme, IconName, Sizable, TitleBar};
-use gpui_component_assets::Assets;
+use gpui_component::{h_flex, ActiveTheme, Icon, IconName, Sizable, TitleBar};
+use gpui_component_assets::Assets as ComponentAssets;
 use gpui_platform::application;
 use robinne::ai::{test_connection, AiProviderProtocol, AiSettings};
 use robinne::app_shortcuts::{
@@ -44,6 +44,7 @@ use robinne::ui::sidebar::{main_sidebar_layout_mode, main_sidebar_width, Panel, 
 use robinne::ui::style::ClaudeLikeColors;
 use robinne::ui::task_panel::TaskPanel;
 use robinne::ui::timeline::Timeline;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -52,6 +53,28 @@ use std::sync::Arc;
 const SETTINGS_NAV_BREAKPOINT: Pixels = px(600.0);
 const SETTINGS_SIDEBAR_NAV_WIDTH: Pixels = px(180.0);
 const QUICK_CAPTURE_DEBOUNCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+const REFRESH_DATA_ICON_PATH: &str = "icons/rotate-cw.svg";
+const REFRESH_DATA_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M21 13a9 9 0 1 1-3-6.7L21 8"/></svg>"#;
+
+struct RobinneAssets;
+
+impl AssetSource for RobinneAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        if path == REFRESH_DATA_ICON_PATH {
+            return Ok(Some(Cow::Borrowed(REFRESH_DATA_ICON)));
+        }
+
+        ComponentAssets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        let mut assets = ComponentAssets.list(path)?;
+        if REFRESH_DATA_ICON_PATH.starts_with(path) {
+            assets.push(REFRESH_DATA_ICON_PATH.into());
+        }
+        Ok(assets)
+    }
+}
 
 actions!(
     app_menu,
@@ -417,7 +440,7 @@ fn install_app_shortcuts_and_menus(
 }
 
 fn main() {
-    let app = application().with_assets(Assets);
+    let app = application().with_assets(RobinneAssets);
 
     let (store, mut runtime) = create_store();
     let settings = load_settings_or_default();
@@ -1547,6 +1570,19 @@ impl MainView {
         });
     }
 
+    fn refresh_all_data_panels(&mut self, cx: &mut Context<Self>) {
+        self.dashboard_panel
+            .update(cx, |panel, cx| panel.refresh_data(cx));
+        self.task_panel
+            .update(cx, |panel, cx| panel.refresh_data(cx));
+        self.notes_panel
+            .update(cx, |panel, cx| panel.refresh_data(cx));
+        self.timeline_panel
+            .update(cx, |panel, cx| panel.refresh_data(cx));
+        self.search_panel
+            .update(cx, |panel, cx| panel.refresh_data(cx));
+    }
+
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         TitleBar::new()
             .bg(transparent_black())
@@ -1565,12 +1601,24 @@ impl MainView {
                     .relative()
                     .h_full()
                     .items_center()
+                    .gap(px(4.0))
                     .pr(px(12.0))
+                    .child(
+                        Button::new("main-titlebar-refresh-data")
+                            .ghost()
+                            .small()
+                            .icon(Icon::empty().path(REFRESH_DATA_ICON_PATH))
+                            .tooltip("刷新数据")
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.refresh_all_data_panels(cx);
+                            })),
+                    )
                     .child(
                         Button::new("main-titlebar-quick-add")
                             .ghost()
                             .small()
                             .icon(IconName::Plus)
+                            .tooltip("快速创建")
                             .on_click(cx.listener(|this, _event, window, cx| {
                                 this.open_quick_add_from_titlebar(window, cx);
                             })),
