@@ -22,7 +22,7 @@ impl Panel {
             Self::Dashboard => "看板",
             Self::Tasks => "任务",
             Self::Records => "记录",
-            Self::Timeline => "事务",
+            Self::Timeline => "时间线",
             Self::AI => "AI",
             Self::Search => "搜索",
             Self::Settings => "设置",
@@ -141,7 +141,7 @@ impl RenderOnce for Sidebar {
             (Panel::Dashboard, "看板", IconName::GalleryVerticalEnd),
             (Panel::Tasks, "任务", IconName::Check),
             (Panel::Records, "记录", IconName::File),
-            (Panel::Timeline, "事务", IconName::Calendar),
+            (Panel::Timeline, "时间线", IconName::Calendar),
             (Panel::AI, "AI", IconName::Bot),
         ];
 

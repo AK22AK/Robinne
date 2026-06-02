@@ -597,7 +597,7 @@ impl Timeline {
                                         .line
                                         .project
                                         .clone()
-                                        .unwrap_or_else(|| "全局事务".to_string()),
+                                        .unwrap_or_else(|| "全局时间线".to_string()),
                                 ),
                             ),
                     )
@@ -756,7 +756,7 @@ impl Timeline {
                         .items_center()
                         .justify_center()
                         .text_color(rgb(0x9ca3af))
-                        .child("暂无事务，使用 ~事务 或 ~项目/事务 创建第一条事务"),
+                        .child("暂无时间线，使用 ~时间线 或 ~项目/时间线 创建第一条时间线"),
                 )
             })
     }
@@ -779,7 +779,7 @@ impl Timeline {
             .border_color(rgb(0xe5e7eb))
             .child(panel_heading("态势"))
             .child(stat_row("项目数", self.graph.stats.project_count))
-            .child(stat_row("开放事务", self.graph.stats.open_line_count))
+            .child(stat_row("开放时间线", self.graph.stats.open_line_count))
             .child(stat_row("记录数", self.graph.stats.record_count))
             .child(stat_row("待办数", self.graph.stats.open_task_count))
             .child(stat_row(
@@ -800,7 +800,7 @@ impl Timeline {
                         this.focus_unassigned(cx);
                     }))
                     .child(stat_row(
-                        "未归事务记录",
+                        "未归时间线记录",
                         self.graph.stats.unassigned_record_count,
                     )),
             )
@@ -836,7 +836,7 @@ impl Timeline {
                                         .line
                                         .project
                                         .clone()
-                                        .unwrap_or_else(|| "全局事务".to_string()),
+                                        .unwrap_or_else(|| "全局时间线".to_string()),
                                 ),
                             ),
                     )
@@ -897,7 +897,7 @@ impl Timeline {
                     )
                     .child(
                         Button::new("line-delete")
-                            .child("删除事务")
+                            .child("删除时间线")
                             .text_color(rgb(0xb91c1c))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.delete_selected_line(cx);
@@ -919,7 +919,7 @@ impl Timeline {
                 h_flex()
                     .justify_between()
                     .items_center()
-                    .child(panel_heading("未归事务记录"))
+                    .child(panel_heading("未归时间线记录"))
                     .child(
                         Button::new("unassigned-close")
                             .child("关闭")
@@ -932,7 +932,7 @@ impl Timeline {
                 div()
                     .text_sm()
                     .text_color(rgb(0x6b7280))
-                    .child("这些记录仍保留原样，可之后通过 ~事务 归入事务。"),
+                    .child("这些记录仍保留原样，可之后通过 ~时间线 归入时间线。"),
             )
             .children(self.graph.unassigned_records.iter().cloned().map(|record| {
                 detail_record_preview(record, cx, |this, record, window, cx| {
@@ -971,14 +971,14 @@ impl Render for Timeline {
                                     .text_xl()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(0x111827))
-                                    .child(format!("事务 ({} 个开放事务)", self.graph.lines.len())),
+                                    .child(format!(
+                                        "时间线 ({} 条开放时间线)",
+                                        self.graph.lines.len()
+                                    )),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x6b7280))
-                                    .child("用 ~事务 或 ~项目/事务 把任务和记录归入正在跟踪的事务"),
-                            ),
+                            .child(div().text_sm().text_color(rgb(0x6b7280)).child(
+                                "用 ~时间线 或 ~项目/时间线 把任务和记录归入正在跟踪的时间线",
+                            )),
                     )
                     .when(self.is_loading, |el| {
                         el.child(div().text_sm().text_color(rgb(0x9ca3af)).child("加载中..."))

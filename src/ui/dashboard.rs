@@ -703,7 +703,7 @@ impl Dashboard {
                                                     );
                                                 },
                                             ))
-                                            .child("查看事务"),
+                                            .child("查看时间线"),
                                     ),
                             )
                             .child(

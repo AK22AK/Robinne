@@ -2724,7 +2724,7 @@ impl MainView {
                     ))
                     .child(self.render_settings_choice_button(
                         "startup-panel-timeline",
-                        "事务",
+                        "时间线",
                         self.app_settings.general.startup_panel == StartupPanelPreference::Timeline,
                         cx.listener(|this, _event, _window, cx| {
                             this.set_startup_panel_preference(StartupPanelPreference::Timeline, cx);
