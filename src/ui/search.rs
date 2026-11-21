@@ -1,5 +1,5 @@
 use crate::models::{Record, RecordType, TaskStatus};
-use crate::store::Store;
+use crate::store::{Store, StoreEvent};
 use crate::ui::record_detail_sidebar::{RecordDetailSidebar, SavePayload as RecordSavePayload};
 use crate::ui::task_detail_sidebar::{SavePayload as TaskSavePayload, TaskDetailSidebar};
 use crate::ui::tokenized_text::{
@@ -213,9 +213,35 @@ impl SearchPanel {
             });
         });
 
-        panel.load_available_tags(cx);
-        panel.load_available_persons(cx);
+        panel.install_data_change_listener(cx);
+        panel.refresh_data(cx);
         panel
+    }
+
+    pub fn refresh_data(&mut self, cx: &mut Context<Self>) {
+        self.refresh_available_metadata(cx);
+        self.refresh_results(cx);
+    }
+
+    fn install_data_change_listener(&mut self, cx: &mut Context<Self>) {
+        let mut changes = self.store.subscribe_data_changes();
+        cx.spawn(async move |view, cx| loop {
+            match changes.recv().await {
+                Ok(StoreEvent::DataChanged)
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if view
+                        .update(cx, |panel, cx| {
+                            panel.refresh_data(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        })
+        .detach();
     }
 
     fn next_browse_filter(

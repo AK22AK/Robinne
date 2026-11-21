@@ -2148,7 +2148,7 @@ impl Render for TaskDetailSidebar {
                                                     div()
                                                         .text_xs()
                                                         .text_color(ClaudeLikeColors::text_tertiary())
-                                                        .child("相关事务"),
+                                                        .child("相关时间线"),
                                                 )
                                                 .child(
                                                     h_flex().gap(px(6.0)).flex_wrap().child(

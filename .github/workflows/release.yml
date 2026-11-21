@@ -21,6 +21,7 @@ jobs:
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - name: Check out release ref
         uses: actions/checkout@v4
@@ -46,8 +47,15 @@ jobs:
             exit 1
           fi
 
+          if [[ "${version}" == 0.* || "${version}" == *-* ]]; then
+            prerelease="true"
+          else
+            prerelease="false"
+          fi
+
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build ${{ matrix.label }}
@@ -154,6 +162,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           draft: false
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
           body_path: ${{ steps.notes.outputs.path }}
           files: |
             dist/*.zip
@@ -166,6 +175,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           draft: false
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
           generate_release_notes: true
           files: |
             dist/*.zip

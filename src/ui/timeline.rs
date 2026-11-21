@@ -1,22 +1,40 @@
 use crate::models::{LineGraphData, LineOverview, Record, RecordType, TaskStatus};
-use crate::store::Store;
+use crate::store::{Store, StoreEvent};
 use crate::ui::record_detail_sidebar::{RecordDetailSidebar, SavePayload as RecordSavePayload};
 use crate::ui::task_detail_sidebar::{SavePayload as TaskSavePayload, TaskDetailSidebar};
 use crate::ui::tokenized_text::{
     render_metadata_chip, render_tokenized_text, MetadataChipKind, TokenTextStyle,
 };
-use chrono::{DateTime, Datelike, Duration, Local, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc, Weekday};
 use gpui::prelude::FluentBuilder as _;
 use gpui::StatefulInteractiveElement as _;
 use gpui::*;
 use gpui_component::button::Button;
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::{h_flex, v_flex};
+use gpui_component::scroll::{ScrollableElement, Scrollbar};
+use gpui_component::{h_flex, v_flex, v_virtual_list, VirtualListScrollHandle};
+use std::rc::Rc;
 use uuid::Uuid;
 
 const LINE_NODE_LIMIT: usize = 5;
 const DETAIL_ACTIVITY_LIMIT: usize = 12;
 const CONTENT_LIMIT: usize = 44;
+const TIMELINE_DATE_HEADER_HEIGHT: f32 = 36.0;
+const TIMELINE_RECORD_COMPACT_HEIGHT: f32 = 82.0;
+const TIMELINE_RECORD_EXPANDED_HEIGHT: f32 = 112.0;
+const TIMELINE_MARKER_ROW_HEIGHT: f32 = 42.0;
+const TIMELINE_ROW_WIDTH_ESTIMATE: f32 = 720.0;
+const SPLIT_DATE_GUTTER_WIDTH: f32 = 92.0;
+const SPLIT_LANE_WIDTH: f32 = 300.0;
+const SPLIT_LANE_GAP: f32 = 20.0;
+const SPLIT_LANE_HEADER_HEIGHT: f32 = 66.0;
+const SPLIT_NODE_HEIGHT: f32 = 86.0;
+const SPLIT_NODE_GAP: f32 = 10.0;
+const SPLIT_DATE_BAND_MIN_HEIGHT: f32 = 118.0;
+const SPLIT_DATE_BAND_PADDING: f32 = 16.0;
+const SPLIT_CURRENT_MARKER_SPACE: f32 = 30.0;
+const SPLIT_ORIGIN_MARKER_SIZE: f32 = 14.0;
+const SPLIT_SCROLL_TRAILING_PADDING: f32 = 32.0;
+const SPLIT_SCROLL_BOTTOM_PADDING: f32 = 48.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TimelineDetailTarget {
@@ -30,11 +48,77 @@ enum FocusTarget {
     Unassigned,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TimelineViewMode {
+    Merged,
+    SplitByTransaction,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+enum TimelineSourceKey {
+    Line(Uuid),
+    Global,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimelineSource {
+    key: TimelineSourceKey,
+    name: String,
+    project: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineRecordItem {
+    record: Record,
+    source: TimelineSource,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineDateGroup {
+    date: NaiveDate,
+    label: String,
+    items: Vec<TimelineRecordItem>,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineSplitColumn {
+    source: TimelineSource,
+    items: Vec<TimelineRecordItem>,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineSplitDateGroup {
+    date: NaiveDate,
+    label: String,
+    columns: Vec<TimelineSplitColumn>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimelineSplitLaneState {
+    has_items: bool,
+    draw_line: bool,
+    show_current: bool,
+    show_origin: bool,
+}
+
+#[derive(Clone, Debug)]
+enum TimelineRow {
+    CurrentMarker,
+    DateHeader { date: NaiveDate, label: String },
+    Record(TimelineRecordItem),
+    OriginMarker,
+}
+
 pub struct Timeline {
     store: Store,
     graph: LineGraphData,
+    merged_rows: Vec<TimelineRow>,
+    merged_row_sizes: Rc<Vec<Size<Pixels>>>,
+    merged_scroll_handle: VirtualListScrollHandle,
+    split_scroll_handle: ScrollHandle,
     selected_project: Option<String>,
     focus_target: Option<FocusTarget>,
+    view_mode: TimelineViewMode,
     is_loading: bool,
     request_generation: usize,
     focus_handle: FocusHandle,
@@ -52,8 +136,13 @@ impl Timeline {
         let mut panel = Self {
             store,
             graph: LineGraphData::default(),
+            merged_rows: Vec::new(),
+            merged_row_sizes: Rc::new(Vec::new()),
+            merged_scroll_handle: VirtualListScrollHandle::new(),
+            split_scroll_handle: ScrollHandle::default(),
             selected_project: None,
             focus_target: None,
+            view_mode: TimelineViewMode::Merged,
             is_loading: false,
             request_generation: 0,
             focus_handle,
@@ -72,8 +161,30 @@ impl Timeline {
         };
 
         panel.install_sidebar_handlers(cx);
+        panel.install_data_change_listener(cx);
         panel.load_graph(cx);
         panel
+    }
+
+    fn install_data_change_listener(&mut self, cx: &mut Context<Self>) {
+        let mut changes = self.store.subscribe_data_changes();
+        cx.spawn(async move |view, cx| loop {
+            match changes.recv().await {
+                Ok(StoreEvent::DataChanged)
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if view
+                        .update(cx, |panel, cx| {
+                            panel.refresh_data(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        })
+        .detach();
     }
 
     fn install_sidebar_handlers(&mut self, cx: &mut Context<Self>) {
@@ -99,7 +210,10 @@ impl Timeline {
         self.task_detail_sidebar.update(cx, |sidebar, _cx| {
             sidebar.on_close(move |cx| {
                 handle.update(cx, |panel, cx| {
-                    panel.close_detail_sidebars(cx);
+                    panel.record_detail_sidebar.update(cx, |sidebar, cx| {
+                        sidebar.dismiss(cx);
+                    });
+                    cx.notify();
                 });
             });
         });
@@ -126,13 +240,16 @@ impl Timeline {
         self.record_detail_sidebar.update(cx, |sidebar, _cx| {
             sidebar.on_close(move |cx| {
                 handle.update(cx, |panel, cx| {
-                    panel.close_detail_sidebars(cx);
+                    panel.task_detail_sidebar.update(cx, |sidebar, cx| {
+                        sidebar.dismiss(cx);
+                    });
+                    cx.notify();
                 });
             });
         });
     }
 
-    fn refresh_data(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_data(&mut self, cx: &mut Context<Self>) {
         self.request_generation += 1;
         self.load_graph(cx);
     }
@@ -150,6 +267,7 @@ impl Timeline {
                             return;
                         }
                         panel.graph = graph;
+                        panel.rebuild_merged_timeline_cache();
                         panel.is_loading = false;
                         panel.prune_focus_after_reload(cx);
                         cx.notify();
@@ -168,6 +286,11 @@ impl Timeline {
             },
         )
         .detach();
+    }
+
+    fn rebuild_merged_timeline_cache(&mut self) {
+        self.merged_rows = merged_timeline_rows(&self.graph);
+        self.merged_row_sizes = timeline_row_sizes(&self.merged_rows);
     }
 
     fn prune_focus_after_reload(&mut self, cx: &mut Context<Self>) {
@@ -191,6 +314,7 @@ impl Timeline {
         cx: &mut Context<Self>,
     ) {
         self.focus_target = None;
+        self.view_mode = TimelineViewMode::Merged;
         self.refresh_data(cx);
     }
 
@@ -227,6 +351,24 @@ impl Timeline {
         }
     }
 
+    fn should_show_global_lane(graph: &LineGraphData) -> bool {
+        graph.stats.unassigned_record_count > 0 || !graph.unassigned_records.is_empty()
+    }
+
+    fn show_merged_view(&mut self, cx: &mut Context<Self>) {
+        self.focus_target = None;
+        self.view_mode = TimelineViewMode::Merged;
+        self.close_detail_sidebars(cx);
+        cx.notify();
+    }
+
+    fn show_split_by_transaction(&mut self, cx: &mut Context<Self>) {
+        self.focus_target = None;
+        self.view_mode = TimelineViewMode::SplitByTransaction;
+        self.close_detail_sidebars(cx);
+        cx.notify();
+    }
+
     fn focus_line(&mut self, line_id: Uuid, cx: &mut Context<Self>) {
         self.focus_target = Some(FocusTarget::Line(line_id));
         self.close_detail_sidebars(cx);
@@ -241,6 +383,7 @@ impl Timeline {
 
     fn clear_focus(&mut self, cx: &mut Context<Self>) {
         self.focus_target = None;
+        self.view_mode = TimelineViewMode::Merged;
         self.close_detail_sidebars(cx);
         cx.notify();
     }
@@ -251,6 +394,7 @@ impl Timeline {
         }
         self.selected_project = project;
         self.focus_target = None;
+        self.view_mode = TimelineViewMode::Merged;
         self.refresh_data(cx);
     }
 
@@ -509,7 +653,7 @@ impl Timeline {
             .gap(px(8.0))
             .flex_wrap()
             .child(
-                filter_chip("line-project-all", "全部项目".to_string(), all_selected).on_click(
+                filter_chip("line-project-all", "全部时间线".to_string(), all_selected).on_click(
                     cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.set_project_filter(None, cx);
                     }),
@@ -532,6 +676,707 @@ impl Timeline {
             )
     }
 
+    fn render_timeline_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .justify_between()
+            .items_center()
+            .gap(px(12.0))
+            .child(self.render_project_filters(cx))
+            .child(match self.view_mode {
+                TimelineViewMode::Merged => Button::new("timeline-split-by-transaction")
+                    .child("按事务拆分")
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_split_by_transaction(cx);
+                    }))
+                    .into_any_element(),
+                TimelineViewMode::SplitByTransaction => Button::new("timeline-return-merged")
+                    .child("返回合并视图")
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_merged_view(cx);
+                    }))
+                    .into_any_element(),
+            })
+    }
+
+    fn render_merged_timeline(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_empty = self.merged_rows.is_empty();
+        let item_sizes = self.merged_row_sizes.clone();
+        let scroll_handle = self.merged_scroll_handle.clone();
+
+        v_flex()
+            .id("timeline-merged")
+            .size_full()
+            .gap(px(12.0))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x111827))
+                            .child("全部时间流水"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x6b7280))
+                            .child("按时间倒序，点击节点查看详情"),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .when(is_empty && !self.is_loading, |el| {
+                        el.child(empty_timeline_state())
+                    })
+                    .when(!is_empty, |el| {
+                        el.child(
+                            v_virtual_list(
+                                cx.entity().clone(),
+                                "timeline-merged-virtual-list",
+                                item_sizes,
+                                |this, visible_range, _window, cx| {
+                                    visible_range
+                                        .filter_map(|row_index| {
+                                            this.render_merged_timeline_row(row_index, cx)
+                                        })
+                                        .collect::<Vec<_>>()
+                                },
+                            )
+                            .track_scroll(&scroll_handle)
+                            .size_full(),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(0.0))
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .child(Scrollbar::vertical(&scroll_handle)),
+                        )
+                    }),
+            )
+    }
+
+    fn render_merged_timeline_row(
+        &self,
+        row_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        match self.merged_rows.get(row_index)? {
+            TimelineRow::CurrentMarker => {
+                Some(self.render_merged_current_marker().into_any_element())
+            }
+            TimelineRow::DateHeader { date, label } => Some(
+                self.render_merged_date_header(*date, label.clone())
+                    .into_any_element(),
+            ),
+            TimelineRow::Record(item) => Some(
+                self.render_merged_record_node(item.clone(), cx)
+                    .into_any_element(),
+            ),
+            TimelineRow::OriginMarker => {
+                Some(self.render_merged_origin_marker().into_any_element())
+            }
+        }
+    }
+
+    fn render_merged_current_marker(&self) -> impl IntoElement {
+        h_flex()
+            .id("timeline-merged-current-marker")
+            .h(px(TIMELINE_MARKER_ROW_HEIGHT))
+            .items_stretch()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .w(px(72.0))
+                    .min_w(px(72.0))
+                    .pt(px(11.0))
+                    .text_xs()
+                    .text_color(rgb(0x6b7280))
+                    .child(format!("当前 {}", Local::now().format("%H:%M"))),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w(px(24.0))
+                    .min_w(px(24.0))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(11.0))
+                            .top(px(18.0))
+                            .bottom(px(0.0))
+                            .w(px(2.0))
+                            .bg(rgb(0xdbe2ea)),
+                    )
+                    .child(current_marker_dot(rgb(0x64748b))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .pt(px(10.0))
+                    .text_xs()
+                    .text_color(rgb(0x6b7280))
+                    .child("正在跟踪"),
+            )
+    }
+
+    fn render_merged_date_header(&self, date: NaiveDate, label: String) -> impl IntoElement {
+        h_flex()
+            .id(format!("timeline-merged-date-{date}"))
+            .h(px(TIMELINE_DATE_HEADER_HEIGHT))
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .w(px(72.0))
+                    .min_w(px(72.0))
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0x111827))
+                    .child(label),
+            )
+            .child(
+                div().relative().w(px(24.0)).min_w(px(24.0)).h_full().child(
+                    div()
+                        .absolute()
+                        .left(px(11.0))
+                        .top(px(0.0))
+                        .bottom(px(0.0))
+                        .w(px(2.0))
+                        .bg(rgb(0xdbe2ea)),
+                ),
+            )
+            .child(div().flex_1())
+    }
+
+    fn render_merged_origin_marker(&self) -> impl IntoElement {
+        h_flex()
+            .id("timeline-merged-origin-marker")
+            .h(px(TIMELINE_MARKER_ROW_HEIGHT))
+            .items_stretch()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .w(px(72.0))
+                    .min_w(px(72.0))
+                    .pt(px(12.0))
+                    .text_xs()
+                    .text_color(rgb(0x9ca3af))
+                    .child("起点"),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w(px(24.0))
+                    .min_w(px(24.0))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(11.0))
+                            .top(px(0.0))
+                            .h(px(18.0))
+                            .w(px(2.0))
+                            .bg(rgb(0xdbe2ea)),
+                    )
+                    .child(origin_marker_dot(rgb(0x64748b), rgb(0xcbd5e1))),
+            )
+            .child(div().flex_1())
+    }
+
+    fn render_merged_record_node(
+        &self,
+        item: TimelineRecordItem,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let record = item.record;
+        let record_for_click = record.clone();
+        let row_height = timeline_record_row_height(&TimelineRecordItem {
+            record: record.clone(),
+            source: item.source.clone(),
+        });
+        h_flex()
+            .id(format!("timeline-merged-record-{}", record.id))
+            .w_full()
+            .h(px(row_height))
+            .min_w(px(0.0))
+            .items_stretch()
+            .gap(px(10.0))
+            .overflow_hidden()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0xf8fafc)))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_record(&record_for_click, window, cx);
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .w(px(72.0))
+                    .min_w(px(72.0))
+                    .pt(px(12.0))
+                    .text_xs()
+                    .text_color(rgb(0x9ca3af))
+                    .child(
+                        record
+                            .created_at
+                            .with_timezone(&Local)
+                            .format("%H:%M")
+                            .to_string(),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w(px(24.0))
+                    .min_w(px(24.0))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(11.0))
+                            .top(px(0.0))
+                            .bottom(px(0.0))
+                            .w(px(2.0))
+                            .bg(rgb(0xdbe2ea)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(5.0))
+                            .top(px(14.0))
+                            .size(px(14.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(rgb(0xffffff))
+                            .bg(Self::node_color(&record)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(px(6.0))
+                    .py(px(9.0))
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .gap(px(6.0))
+                            .flex_wrap()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x6b7280))
+                                    .child(Self::status_label(&record)),
+                            )
+                            .child(render_source_chip(&item.source))
+                            .children(record.tags.iter().enumerate().map(|(idx, tag)| {
+                                div()
+                                    .id(("timeline-merged-tag", idx))
+                                    .child(render_metadata_chip(MetadataChipKind::Tag, tag))
+                            }))
+                            .children(record.persons.iter().enumerate().map(|(idx, person)| {
+                                div()
+                                    .id(("timeline-merged-person", idx))
+                                    .child(render_metadata_chip(MetadataChipKind::Person, person))
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .text_sm()
+                            .line_height(relative(1.35))
+                            .text_color(rgb(0x1f2937))
+                            .child(render_tokenized_text(
+                                &Self::record_summary(&record, 96),
+                                TokenTextStyle::new(rgb(0x1f2937), FontWeight::NORMAL),
+                            )),
+                    ),
+            )
+    }
+
+    fn render_split_by_transaction(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sources = all_timeline_sources(&self.graph);
+        let date_groups = split_timeline_by_transaction(&self.graph);
+        let content_width = split_timeline_content_width(sources.len());
+        let content_height = split_timeline_content_height(&date_groups);
+        let is_empty = sources.is_empty() || date_groups.is_empty();
+
+        div()
+            .id("timeline-split-by-transaction")
+            .size_full()
+            .overflow_hidden()
+            .when(is_empty && !self.is_loading, |el| {
+                el.child(empty_timeline_state())
+            })
+            .when(!is_empty, |el| {
+                el.child(
+                    v_flex()
+                        .id("timeline-split-vertical-scroll")
+                        .size_full()
+                        .min_h_0()
+                        .track_scroll(&self.split_scroll_handle)
+                        .overflow_y_scroll()
+                        .vertical_scrollbar(&self.split_scroll_handle)
+                        .child(
+                            div()
+                                .id("timeline-split-horizontal-scroll")
+                                .w_full()
+                                .h(px(content_height))
+                                .min_h(px(content_height))
+                                .overflow_x_scrollbar()
+                                .child(
+                                    v_flex()
+                                        .id("timeline-split-shared-bands")
+                                        .w(px(content_width))
+                                        .min_w(px(content_width))
+                                        .h(px(content_height))
+                                        .min_h(px(content_height))
+                                        .child(self.render_split_lane_headers(&sources, cx))
+                                        .children(date_groups.iter().cloned().map(|group| {
+                                            self.render_split_date_band(
+                                                group,
+                                                &sources,
+                                                &date_groups,
+                                                cx,
+                                            )
+                                        }))
+                                        .child(div().h(px(SPLIT_SCROLL_BOTTOM_PADDING))),
+                                ),
+                        ),
+                )
+            })
+    }
+
+    fn render_split_lane_headers(
+        &self,
+        sources: &[TimelineSource],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .id("timeline-split-lane-headers")
+            .items_stretch()
+            .gap(px(SPLIT_LANE_GAP))
+            .h(px(SPLIT_LANE_HEADER_HEIGHT))
+            .child(
+                div()
+                    .w(px(SPLIT_DATE_GUTTER_WIDTH))
+                    .min_w(px(SPLIT_DATE_GUTTER_WIDTH)),
+            )
+            .children(
+                sources
+                    .iter()
+                    .cloned()
+                    .map(|source| self.render_split_lane_header(source, cx)),
+            )
+    }
+
+    fn render_split_lane_header(
+        &self,
+        source: TimelineSource,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let key = source.key;
+        let is_global = source.key == TimelineSourceKey::Global;
+        let source_label = source_chip_label(&source);
+        let subtitle = if is_global {
+            Some("全局".to_string())
+        } else {
+            source.project.clone()
+        };
+
+        v_flex()
+            .id(format!("timeline-split-lane-header-{source_label}"))
+            .w(px(SPLIT_LANE_WIDTH))
+            .min_w(px(SPLIT_LANE_WIDTH))
+            .gap(px(4.0))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                match key {
+                    TimelineSourceKey::Line(line_id) => this.focus_line(line_id, cx),
+                    TimelineSourceKey::Global => this.focus_unassigned(cx),
+                }
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if is_global {
+                        rgb(0x065f46)
+                    } else {
+                        rgb(0x111827)
+                    })
+                    .child(source.name),
+            )
+            .when_some(subtitle, |el, subtitle| {
+                el.child(div().text_xs().text_color(rgb(0x6b7280)).child(subtitle))
+            })
+    }
+
+    fn render_split_date_band(
+        &self,
+        group: TimelineSplitDateGroup,
+        sources: &[TimelineSource],
+        all_groups: &[TimelineSplitDateGroup],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_current_band = all_groups
+            .iter()
+            .map(|group| group.date)
+            .max()
+            .is_some_and(|date| date == group.date);
+        let height = split_date_group_height(&group)
+            + if is_current_band {
+                SPLIT_CURRENT_MARKER_SPACE
+            } else {
+                0.0
+            };
+        let date = group.date;
+
+        h_flex()
+            .id(format!("timeline-split-date-band-{date}"))
+            .items_stretch()
+            .gap(px(SPLIT_LANE_GAP))
+            .h(px(height))
+            .child(
+                div()
+                    .w(px(SPLIT_DATE_GUTTER_WIDTH))
+                    .min_w(px(SPLIT_DATE_GUTTER_WIDTH))
+                    .pt(px(10.0))
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0x111827))
+                    .child(group.label.clone()),
+            )
+            .children(
+                sources.iter().cloned().map(|source| {
+                    self.render_split_date_lane(source, &group, all_groups, height, cx)
+                }),
+            )
+    }
+
+    fn render_split_date_lane(
+        &self,
+        source: TimelineSource,
+        group: &TimelineSplitDateGroup,
+        all_groups: &[TimelineSplitDateGroup],
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let items = group
+            .columns
+            .iter()
+            .find(|column| column.source.key == source.key)
+            .map(|column| column.items.clone())
+            .unwrap_or_default();
+        let state = split_lane_state(all_groups, source.key, group.date);
+        let is_global = source.key == TimelineSourceKey::Global;
+        let top_padding = if state.show_current {
+            SPLIT_CURRENT_MARKER_SPACE
+        } else {
+            0.0
+        };
+        let line_end = split_lane_line_end(height, items.len(), state.show_origin, top_padding);
+        div()
+            .id(format!(
+                "timeline-split-date-lane-{}-{}",
+                group.date,
+                source_chip_label(&source)
+            ))
+            .relative()
+            .w(px(SPLIT_LANE_WIDTH))
+            .min_w(px(SPLIT_LANE_WIDTH))
+            .h(px(height))
+            .pl(px(24.0))
+            .overflow_hidden()
+            .when(state.draw_line, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(7.0))
+                        .top(px(0.0))
+                        .h(px(line_end))
+                        .w(px(2.0))
+                        .bg(if is_global {
+                            rgb(0xbbf7d0)
+                        } else {
+                            rgb(0xdbe2ea)
+                        }),
+                )
+            })
+            .when(state.show_current, |el| {
+                el.child(self.render_split_current_marker(is_global))
+            })
+            .when(!items.is_empty(), |el| {
+                el.child(
+                    v_flex()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .pt(px(top_padding))
+                        .gap(px(SPLIT_NODE_GAP))
+                        .children(
+                            items
+                                .into_iter()
+                                .map(|item| self.render_split_lane_record(item.record, cx)),
+                        ),
+                )
+            })
+            .when(state.show_origin, |el| {
+                el.child(self.render_split_origin_marker(line_end, is_global))
+            })
+    }
+
+    fn render_split_current_marker(&self, is_global: bool) -> impl IntoElement {
+        let color = if is_global {
+            rgb(0x16a34a)
+        } else {
+            rgb(0x64748b)
+        };
+        div()
+            .absolute()
+            .left(px(-2.0))
+            .top(px(0.0))
+            .w(px(64.0))
+            .h(px(20.0))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .size(px(18.0))
+                    .rounded(px(9.0))
+                    .border_2()
+                    .border_color(rgb(0xffffff))
+                    .bg(color)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(5.0))
+                            .top(px(5.0))
+                            .size(px(6.0))
+                            .rounded(px(3.0))
+                            .bg(rgb(0xffffff)),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(24.0))
+                    .top(px(1.0))
+                    .text_xs()
+                    .text_color(color)
+                    .child("当前"),
+            )
+    }
+
+    fn render_split_origin_marker(&self, line_end: f32, is_global: bool) -> impl IntoElement {
+        div()
+            .absolute()
+            .left(px(1.0))
+            .top(px(line_end - (SPLIT_ORIGIN_MARKER_SIZE / 2.0)))
+            .size(px(SPLIT_ORIGIN_MARKER_SIZE))
+            .rounded(px(SPLIT_ORIGIN_MARKER_SIZE / 2.0))
+            .border_2()
+            .border_color(if is_global {
+                rgb(0x86efac)
+            } else {
+                rgb(0xcbd5e1)
+            })
+            .bg(rgb(0xffffff))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(3.0))
+                    .top(px(3.0))
+                    .size(px(6.0))
+                    .rounded(px(3.0))
+                    .bg(if is_global {
+                        rgb(0x16a34a)
+                    } else {
+                        rgb(0x64748b)
+                    }),
+            )
+    }
+
+    fn render_split_lane_record(&self, record: Record, cx: &mut Context<Self>) -> impl IntoElement {
+        let record_for_click = record.clone();
+        div()
+            .id(format!("timeline-split-lane-record-{}", record.id))
+            .relative()
+            .w_full()
+            .min_w(px(0.0))
+            .h(px(SPLIT_NODE_HEIGHT))
+            .overflow_hidden()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_record(&record_for_click, window, cx);
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(-18.0))
+                    .top(px(8.0))
+                    .size(px(12.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(0xffffff))
+                    .bg(Self::node_color(&record)),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .gap(px(5.0))
+                    .p(px(8.0))
+                    .rounded(px(7.0))
+                    .hover(|style| style.bg(rgb(0xf8fafc)))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div().text_xs().text_color(rgb(0x9ca3af)).child(
+                                    record
+                                        .created_at
+                                        .with_timezone(&Local)
+                                        .format("%H:%M")
+                                        .to_string(),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x6b7280))
+                                    .child(Self::status_label(&record)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_sm()
+                            .line_height(relative(1.3))
+                            .text_color(rgb(0x1f2937))
+                            .child(render_tokenized_text(
+                                &Self::record_summary(&record, 52),
+                                TokenTextStyle::new(rgb(0x1f2937), FontWeight::NORMAL),
+                            )),
+                    ),
+            )
+    }
+
     fn render_line_lane(
         &self,
         overview: &LineOverview,
@@ -541,6 +1386,7 @@ impl Timeline {
     ) -> impl IntoElement {
         let line_id = overview.line.id;
         let is_focused = self.focus_target == Some(FocusTarget::Line(line_id));
+        let lane_width = if is_focused { 520.0 } else { 280.0 };
         let is_dimmed = matches!(self.focus_target, Some(FocusTarget::Line(id)) if id != line_id)
             || self.focus_target == Some(FocusTarget::Unassigned);
         let records = overview
@@ -552,8 +1398,8 @@ impl Timeline {
 
         div()
             .id(format!("line-lane-{line_id}"))
-            .w(px(280.0))
-            .min_w(px(280.0))
+            .w(px(lane_width))
+            .min_w(px(lane_width))
             .h_full()
             .p(px(10.0))
             .rounded(px(8.0))
@@ -591,15 +1437,9 @@ impl Timeline {
                                     })
                                     .child(overview.line.name.clone()),
                             )
-                            .child(
-                                div().text_xs().text_color(rgb(0x6b7280)).child(
-                                    overview
-                                        .line
-                                        .project
-                                        .clone()
-                                        .unwrap_or_else(|| "全局事务".to_string()),
-                                ),
-                            ),
+                            .when_some(overview.line.project.clone(), |el, project| {
+                                el.child(div().text_xs().text_color(rgb(0x6b7280)).child(project))
+                            }),
                     )
                     .child(
                         div()
@@ -733,32 +1573,115 @@ impl Timeline {
     fn render_graph(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_task_id = self.selected_task_id(cx);
         let selected_record_id = self.selected_record_id(cx);
-        h_flex()
-            .id("line-graph-scroll")
-            .size_full()
-            .gap(px(14.0))
-            .min_w(px(0.0))
-            .overflow_x_scrollbar()
-            .children(self.graph.lines.iter().map(|overview| {
-                self.render_line_lane(
+        if let Some(overview) = self.selected_line() {
+            return div()
+                .id("line-graph-focused")
+                .size_full()
+                .overflow_y_scrollbar()
+                .child(self.render_line_lane(
                     overview,
                     selected_task_id.as_deref(),
                     selected_record_id.as_deref(),
                     cx,
+                ))
+                .into_any_element();
+        }
+
+        if self.focus_target == Some(FocusTarget::Unassigned) {
+            return self
+                .render_global_lane(
+                    selected_task_id.as_deref(),
+                    selected_record_id.as_deref(),
+                    cx,
                 )
-            }))
-            .when(self.graph.lines.is_empty() && !self.is_loading, |el| {
-                el.child(
-                    div()
-                        .w_full()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(rgb(0x9ca3af))
-                        .child("暂无事务，使用 ~事务 或 ~项目/事务 创建第一条事务"),
-                )
-            })
+                .into_any_element();
+        }
+
+        match self.view_mode {
+            TimelineViewMode::Merged => self.render_merged_timeline(cx).into_any_element(),
+            TimelineViewMode::SplitByTransaction => {
+                self.render_split_by_transaction(cx).into_any_element()
+            }
+        }
+    }
+
+    fn render_global_lane(
+        &self,
+        selected_task_id: Option<&str>,
+        selected_record_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("line-global-lane")
+            .size_full()
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .w(px(520.0))
+                    .min_w(px(520.0))
+                    .h_full()
+                    .p(px(12.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(0xd1fae5))
+                    .bg(rgb(0xf7fefb))
+                    .child(
+                        v_flex()
+                            .gap(px(10.0))
+                            .child(
+                                v_flex()
+                                    .gap(px(3.0))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(0x065f46))
+                                            .child("全局时间线"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x6b7280))
+                                            .child("未指定具体时间线的记录"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .min_h(px(250.0))
+                                    .pl(px(14.0))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .left(px(4.0))
+                                            .top(px(0.0))
+                                            .bottom(px(0.0))
+                                            .w(px(2.0))
+                                            .bg(rgb(0xbbf7d0)),
+                                    )
+                                    .children(self.graph.unassigned_records.iter().enumerate().map(
+                                        |(idx, record)| {
+                                            self.render_lane_node(
+                                                idx,
+                                                record,
+                                                selected_task_id,
+                                                selected_record_id,
+                                                cx,
+                                            )
+                                        },
+                                    ))
+                                    .when(self.graph.unassigned_records.is_empty(), |el| {
+                                        el.child(
+                                            div()
+                                                .pt(px(12.0))
+                                                .text_xs()
+                                                .text_color(rgb(0x9ca3af))
+                                                .child("暂无未归属记录"),
+                                        )
+                                    }),
+                            ),
+                    ),
+            )
     }
 
     fn render_stats_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -779,7 +1702,7 @@ impl Timeline {
             .border_color(rgb(0xe5e7eb))
             .child(panel_heading("态势"))
             .child(stat_row("项目数", self.graph.stats.project_count))
-            .child(stat_row("开放事务", self.graph.stats.open_line_count))
+            .child(stat_row("开放时间线", self.graph.stats.open_line_count))
             .child(stat_row("记录数", self.graph.stats.record_count))
             .child(stat_row("待办数", self.graph.stats.open_task_count))
             .child(stat_row(
@@ -800,7 +1723,7 @@ impl Timeline {
                         this.focus_unassigned(cx);
                     }))
                     .child(stat_row(
-                        "未归事务记录",
+                        "未归时间线记录",
                         self.graph.stats.unassigned_record_count,
                     )),
             )
@@ -830,15 +1753,9 @@ impl Timeline {
                         v_flex()
                             .gap(px(3.0))
                             .child(panel_heading(overview.line.name.clone()))
-                            .child(
-                                div().text_xs().text_color(rgb(0x6b7280)).child(
-                                    overview
-                                        .line
-                                        .project
-                                        .clone()
-                                        .unwrap_or_else(|| "全局事务".to_string()),
-                                ),
-                            ),
+                            .when_some(overview.line.project.clone(), |el, project| {
+                                el.child(div().text_xs().text_color(rgb(0x6b7280)).child(project))
+                            }),
                     )
                     .child(
                         Button::new("line-detail-close")
@@ -897,7 +1814,7 @@ impl Timeline {
                     )
                     .child(
                         Button::new("line-delete")
-                            .child("删除事务")
+                            .child("删除时间线")
                             .text_color(rgb(0xb91c1c))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.delete_selected_line(cx);
@@ -919,7 +1836,7 @@ impl Timeline {
                 h_flex()
                     .justify_between()
                     .items_center()
-                    .child(panel_heading("未归事务记录"))
+                    .child(panel_heading("未归时间线记录"))
                     .child(
                         Button::new("unassigned-close")
                             .child("关闭")
@@ -932,7 +1849,7 @@ impl Timeline {
                 div()
                     .text_sm()
                     .text_color(rgb(0x6b7280))
-                    .child("这些记录仍保留原样，可之后通过 ~事务 归入事务。"),
+                    .child("这些记录仍保留原样，可之后通过 ~时间线 归入时间线。"),
             )
             .children(self.graph.unassigned_records.iter().cloned().map(|record| {
                 detail_record_preview(record, cx, |this, record, window, cx| {
@@ -944,6 +1861,11 @@ impl Timeline {
 
 impl Render for Timeline {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let global_suffix = if Self::should_show_global_lane(&self.graph) {
+            "，含全局"
+        } else {
+            ""
+        };
         v_flex()
             .size_full()
             .overflow_hidden()
@@ -956,6 +1878,12 @@ impl Render for Timeline {
                     window.prevent_default();
                     cx.stop_propagation();
                     this.clear_focus(cx);
+                } else if event.keystroke.key.as_str() == "escape"
+                    && this.view_mode != TimelineViewMode::Merged
+                {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    this.show_merged_view(cx);
                 }
             }))
             .child(
@@ -971,20 +1899,24 @@ impl Render for Timeline {
                                     .text_xl()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(0x111827))
-                                    .child(format!("事务 ({} 个开放事务)", self.graph.lines.len())),
+                                    .child(format!(
+                                        "时间线 ({} 条跟踪中{})",
+                                        self.graph.lines.len(),
+                                        global_suffix
+                                    )),
                             )
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x6b7280))
-                                    .child("用 ~事务 或 ~项目/事务 把任务和记录归入正在跟踪的事务"),
+                                    .child("用 ~时间线 或 ~项目/时间线 归入正在跟踪的事情"),
                             ),
                     )
                     .when(self.is_loading, |el| {
                         el.child(div().text_sm().text_color(rgb(0x9ca3af)).child("加载中..."))
                     }),
             )
-            .child(self.render_project_filters(cx))
+            .child(self.render_timeline_controls(cx))
             .child(
                 h_flex()
                     .id("line-graph-main")
@@ -1003,7 +1935,9 @@ impl Render for Timeline {
                             .h_full()
                             .child(self.render_graph(cx)),
                     )
-                    .child(self.render_stats_panel(cx)),
+                    .when(self.focus_target.is_some(), |el| {
+                        el.child(self.render_stats_panel(cx))
+                    }),
             )
             .child(self.task_detail_sidebar.clone())
             .child(self.record_detail_sidebar.clone())
@@ -1013,6 +1947,622 @@ impl Render for Timeline {
 impl Focusable for Timeline {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+fn line_source(overview: &LineOverview) -> TimelineSource {
+    TimelineSource {
+        key: TimelineSourceKey::Line(overview.line.id),
+        name: overview.line.name.clone(),
+        project: overview.line.project.clone(),
+    }
+}
+
+fn global_source() -> TimelineSource {
+    TimelineSource {
+        key: TimelineSourceKey::Global,
+        name: "全局".to_string(),
+        project: None,
+    }
+}
+
+fn source_chip_label(source: &TimelineSource) -> String {
+    match source.key {
+        TimelineSourceKey::Line(_) => match source.project.as_deref() {
+            Some(project) if !project.trim().is_empty() => {
+                format!("~{project}/{}", source.name)
+            }
+            _ => format!("~{}", source.name),
+        },
+        TimelineSourceKey::Global => "全局".to_string(),
+    }
+}
+
+fn render_source_chip(source: &TimelineSource) -> AnyElement {
+    match source.key {
+        TimelineSourceKey::Line(_) => {
+            render_metadata_chip(MetadataChipKind::Line, &source_chip_label(source))
+        }
+        TimelineSourceKey::Global => compact_badge("全局").into_any_element(),
+    }
+}
+
+fn current_marker_dot(color: Rgba) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(3.0))
+        .top(px(10.0))
+        .size(px(18.0))
+        .rounded(px(9.0))
+        .border_2()
+        .border_color(rgb(0xffffff))
+        .bg(color)
+        .child(
+            div()
+                .absolute()
+                .left(px(5.0))
+                .top(px(5.0))
+                .size(px(6.0))
+                .rounded(px(3.0))
+                .bg(rgb(0xffffff)),
+        )
+}
+
+fn origin_marker_dot(fill: Rgba, border: Rgba) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(4.0))
+        .top(px(11.0))
+        .size(px(16.0))
+        .rounded(px(8.0))
+        .border_2()
+        .border_color(border)
+        .bg(rgb(0xffffff))
+        .child(
+            div()
+                .absolute()
+                .left(px(4.0))
+                .top(px(4.0))
+                .size(px(6.0))
+                .rounded(px(3.0))
+                .bg(fill),
+        )
+}
+
+fn empty_timeline_state() -> AnyElement {
+    div()
+        .w_full()
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(0x9ca3af))
+        .child("暂无时间线，使用 ~时间线 或 ~项目/时间线 创建第一条时间线")
+        .into_any_element()
+}
+
+fn all_timeline_sources(graph: &LineGraphData) -> Vec<TimelineSource> {
+    let mut sources = graph.lines.iter().map(line_source).collect::<Vec<_>>();
+    if Timeline::should_show_global_lane(graph) {
+        sources.push(global_source());
+    }
+    sources
+}
+
+fn merged_timeline_items(graph: &LineGraphData) -> Vec<TimelineRecordItem> {
+    let mut items = Vec::new();
+    for overview in &graph.lines {
+        let source = line_source(overview);
+        items.extend(
+            overview
+                .records
+                .iter()
+                .cloned()
+                .map(|record| TimelineRecordItem {
+                    record,
+                    source: source.clone(),
+                }),
+        );
+    }
+
+    let source = global_source();
+    items.extend(
+        graph
+            .unassigned_records
+            .iter()
+            .cloned()
+            .map(|record| TimelineRecordItem {
+                record,
+                source: source.clone(),
+            }),
+    );
+
+    items.sort_by(|left, right| right.record.created_at.cmp(&left.record.created_at));
+    items
+}
+
+fn record_date(record: &Record) -> NaiveDate {
+    record.created_at.with_timezone(&Local).date_naive()
+}
+
+fn date_group_label(date: NaiveDate) -> String {
+    let today = Local::now().date_naive();
+    let yesterday = today - Duration::days(1);
+    if date == today {
+        "今天".to_string()
+    } else if date == yesterday {
+        "昨天".to_string()
+    } else if date.year() == today.year() {
+        date.format("%-m月%-d日").to_string()
+    } else {
+        date.format("%Y年%-m月%-d日").to_string()
+    }
+}
+
+fn group_items_by_date(items: Vec<TimelineRecordItem>) -> Vec<TimelineDateGroup> {
+    let mut groups: Vec<TimelineDateGroup> = Vec::new();
+    for item in items {
+        let date = record_date(&item.record);
+        if let Some(group) = groups.iter_mut().find(|group| group.date == date) {
+            group.items.push(item);
+        } else {
+            groups.push(TimelineDateGroup {
+                date,
+                label: date_group_label(date),
+                items: vec![item],
+            });
+        }
+    }
+    groups.sort_by(|left, right| right.date.cmp(&left.date));
+    groups
+}
+
+fn merged_timeline_rows(graph: &LineGraphData) -> Vec<TimelineRow> {
+    let groups = group_items_by_date(merged_timeline_items(graph));
+    if groups.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+    rows.push(TimelineRow::CurrentMarker);
+    rows.extend(groups.into_iter().flat_map(|group| {
+        let mut rows = Vec::with_capacity(group.items.len() + 1);
+        rows.push(TimelineRow::DateHeader {
+            date: group.date,
+            label: group.label,
+        });
+        rows.extend(group.items.into_iter().map(TimelineRow::Record));
+        rows
+    }));
+    rows.push(TimelineRow::OriginMarker);
+    rows
+}
+
+fn timeline_row_sizes(rows: &[TimelineRow]) -> Rc<Vec<Size<Pixels>>> {
+    Rc::new(rows.iter().map(timeline_row_size).collect())
+}
+
+fn timeline_row_size(row: &TimelineRow) -> Size<Pixels> {
+    let height = match row {
+        TimelineRow::CurrentMarker | TimelineRow::OriginMarker => TIMELINE_MARKER_ROW_HEIGHT,
+        TimelineRow::DateHeader { .. } => TIMELINE_DATE_HEADER_HEIGHT,
+        TimelineRow::Record(item) => timeline_record_row_height(item),
+    };
+    size(px(TIMELINE_ROW_WIDTH_ESTIMATE), px(height))
+}
+
+fn timeline_record_row_height(item: &TimelineRecordItem) -> f32 {
+    let record = &item.record;
+    let summary_len = Timeline::record_summary(record, 96).chars().count();
+    let metadata_count = 1 + record.tags.len() + record.persons.len();
+    if summary_len > 48 || metadata_count > 4 {
+        TIMELINE_RECORD_EXPANDED_HEIGHT
+    } else {
+        TIMELINE_RECORD_COMPACT_HEIGHT
+    }
+}
+
+fn split_timeline_content_width(source_count: usize) -> f32 {
+    SPLIT_DATE_GUTTER_WIDTH
+        + (source_count as f32 * SPLIT_LANE_WIDTH)
+        + (source_count as f32 * SPLIT_LANE_GAP)
+        + SPLIT_SCROLL_TRAILING_PADDING
+}
+
+fn split_timeline_content_height(groups: &[TimelineSplitDateGroup]) -> f32 {
+    let current_date = groups.iter().map(|group| group.date).max();
+    SPLIT_LANE_HEADER_HEIGHT
+        + groups
+            .iter()
+            .map(|group| {
+                split_date_group_height(group)
+                    + if current_date == Some(group.date) {
+                        SPLIT_CURRENT_MARKER_SPACE
+                    } else {
+                        0.0
+                    }
+            })
+            .sum::<f32>()
+        + SPLIT_SCROLL_BOTTOM_PADDING
+}
+
+fn split_date_group_height(group: &TimelineSplitDateGroup) -> f32 {
+    let max_items = group
+        .columns
+        .iter()
+        .map(|column| column.items.len())
+        .max()
+        .unwrap_or(0);
+    if max_items == 0 {
+        return SPLIT_DATE_BAND_MIN_HEIGHT;
+    }
+
+    let content_height = (max_items as f32 * SPLIT_NODE_HEIGHT)
+        + (max_items.saturating_sub(1) as f32 * SPLIT_NODE_GAP)
+        + SPLIT_DATE_BAND_PADDING;
+    content_height.max(SPLIT_DATE_BAND_MIN_HEIGHT)
+}
+
+fn split_lane_line_end(height: f32, item_count: usize, show_origin: bool, top_padding: f32) -> f32 {
+    if !show_origin {
+        return height;
+    }
+
+    let content_end = top_padding
+        + (item_count as f32 * SPLIT_NODE_HEIGHT)
+        + (item_count.saturating_sub(1) as f32 * SPLIT_NODE_GAP)
+        + 8.0;
+    content_end
+        .max(18.0)
+        .min(height - (SPLIT_ORIGIN_MARKER_SIZE / 2.0))
+}
+
+fn split_lane_state(
+    groups: &[TimelineSplitDateGroup],
+    source_key: TimelineSourceKey,
+    date: NaiveDate,
+) -> TimelineSplitLaneState {
+    let source_dates = groups
+        .iter()
+        .filter(|group| {
+            group
+                .columns
+                .iter()
+                .any(|column| column.source.key == source_key && !column.items.is_empty())
+        })
+        .map(|group| group.date)
+        .collect::<Vec<_>>();
+
+    let Some(newest_date) = source_dates.iter().max().copied() else {
+        return TimelineSplitLaneState {
+            has_items: false,
+            draw_line: false,
+            show_current: false,
+            show_origin: false,
+        };
+    };
+    let current_date = groups
+        .iter()
+        .map(|group| group.date)
+        .max()
+        .unwrap_or(newest_date);
+    let oldest_date = source_dates.iter().min().copied().unwrap_or(newest_date);
+    let has_items = source_dates.contains(&date);
+    let is_open_range = date <= current_date && date >= oldest_date;
+
+    TimelineSplitLaneState {
+        has_items,
+        draw_line: is_open_range,
+        show_current: date == current_date,
+        show_origin: has_items && date == oldest_date,
+    }
+}
+
+fn split_timeline_by_transaction(graph: &LineGraphData) -> Vec<TimelineSplitDateGroup> {
+    let sources = all_timeline_sources(graph);
+    group_items_by_date(merged_timeline_items(graph))
+        .into_iter()
+        .map(|group| {
+            let columns = sources
+                .iter()
+                .cloned()
+                .filter_map(|source| {
+                    let items = group
+                        .items
+                        .iter()
+                        .filter(|item| item.source.key == source.key)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if items.is_empty() {
+                        None
+                    } else {
+                        Some(TimelineSplitColumn { source, items })
+                    }
+                })
+                .collect::<Vec<_>>();
+            TimelineSplitDateGroup {
+                date: group.date,
+                label: group.label,
+                columns,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        group_items_by_date, merged_timeline_items, merged_timeline_rows, split_lane_state,
+        split_timeline_by_transaction, timeline_row_sizes, TimelineRow, TimelineSourceKey,
+    };
+    use crate::models::{Line, LineGraphData, LineGraphStats, LineOverview, LineStatus, Record};
+    use chrono::{TimeZone, Utc};
+    use uuid::Uuid;
+
+    fn test_line(id: u128, name: &str, records: Vec<Record>) -> LineOverview {
+        let now = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        LineOverview {
+            line: Line {
+                id: Uuid::from_u128(id),
+                name: name.to_string(),
+                project: None,
+                status: LineStatus::Open,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+            },
+            record_count: records.len(),
+            open_task_count: 0,
+            next_action: None,
+            latest_record: records.first().cloned(),
+            records,
+        }
+    }
+
+    fn note_at(title: &str, year: i32, month: u32, day: u32, hour: u32) -> Record {
+        let mut record = Record::new_note(title.to_string());
+        record.created_at = Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap();
+        record
+    }
+
+    #[test]
+    fn merged_timeline_items_include_unassigned_and_sort_newest_first() {
+        let older = note_at("older", 2026, 6, 1, 10);
+        let newer = note_at("newer", 2026, 6, 3, 10);
+        let global = note_at("global", 2026, 6, 2, 10);
+        let graph = LineGraphData {
+            lines: vec![test_line(1, "事务", vec![older, newer])],
+            unassigned_records: vec![global],
+            stats: LineGraphStats {
+                unassigned_record_count: 1,
+                ..LineGraphStats::default()
+            },
+            ..LineGraphData::default()
+        };
+
+        let items = merged_timeline_items(&graph);
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.record.title.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["newer", "global", "older"]
+        );
+        assert_eq!(items[1].source.key, TimelineSourceKey::Global);
+    }
+
+    #[test]
+    fn date_groups_keep_cross_transaction_records_in_same_day_bucket() {
+        let left = note_at("left", 2026, 6, 3, 8);
+        let right = note_at("right", 2026, 6, 3, 9);
+        let graph = LineGraphData {
+            lines: vec![
+                test_line(1, "左事务", vec![left]),
+                test_line(2, "右事务", vec![right]),
+            ],
+            ..LineGraphData::default()
+        };
+
+        let groups = group_items_by_date(merged_timeline_items(&graph));
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items.len(), 2);
+    }
+
+    #[test]
+    fn split_by_transaction_maps_unassigned_records_to_global_column() {
+        let line_record = note_at("line", 2026, 6, 3, 10);
+        let global_record = note_at("global", 2026, 6, 3, 11);
+        let graph = LineGraphData {
+            lines: vec![test_line(1, "事务", vec![line_record])],
+            unassigned_records: vec![global_record],
+            stats: LineGraphStats {
+                unassigned_record_count: 1,
+                ..LineGraphStats::default()
+            },
+            ..LineGraphData::default()
+        };
+
+        let groups = split_timeline_by_transaction(&graph);
+        assert_eq!(
+            groups[0].date,
+            Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0)
+                .unwrap()
+                .date_naive()
+        );
+        assert!(!groups[0].label.is_empty());
+        let global_column = groups[0]
+            .columns
+            .iter()
+            .find(|column| column.source.key == TimelineSourceKey::Global)
+            .expect("expected global column");
+
+        assert_eq!(global_column.items.len(), 1);
+        assert_eq!(
+            global_column.items[0].record.title.as_deref(),
+            Some("global")
+        );
+    }
+
+    #[test]
+    fn split_by_transaction_omits_empty_columns_inside_each_date_group() {
+        let left = note_at("left", 2026, 6, 3, 10);
+        let right = note_at("right", 2026, 5, 30, 10);
+        let graph = LineGraphData {
+            lines: vec![
+                test_line(1, "左事务", vec![left]),
+                test_line(2, "右事务", vec![right]),
+            ],
+            ..LineGraphData::default()
+        };
+
+        let groups = split_timeline_by_transaction(&graph);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].columns.len(), 1);
+        assert_eq!(
+            groups[0].columns[0].source.key,
+            TimelineSourceKey::Line(Uuid::from_u128(1))
+        );
+        assert_eq!(groups[1].columns.len(), 1);
+        assert_eq!(
+            groups[1].columns[0].source.key,
+            TimelineSourceKey::Line(Uuid::from_u128(2))
+        );
+    }
+
+    #[test]
+    fn split_lane_state_connects_empty_middle_dates_and_marks_origin() {
+        let newest = note_at("newest", 2026, 6, 3, 10);
+        let middle_other = note_at("middle-other", 2026, 6, 2, 10);
+        let oldest = note_at("oldest", 2026, 6, 1, 10);
+        let graph = LineGraphData {
+            lines: vec![
+                test_line(1, "目标事务", vec![newest, oldest]),
+                test_line(2, "其他事务", vec![middle_other]),
+            ],
+            ..LineGraphData::default()
+        };
+        let groups = split_timeline_by_transaction(&graph);
+        let source_key = TimelineSourceKey::Line(Uuid::from_u128(1));
+
+        let newest_state = split_lane_state(&groups, source_key, groups[0].date);
+        let middle_state = split_lane_state(&groups, source_key, groups[1].date);
+        let oldest_state = split_lane_state(&groups, source_key, groups[2].date);
+
+        assert!(newest_state.has_items);
+        assert!(newest_state.draw_line);
+        assert!(newest_state.show_current);
+        assert!(!newest_state.show_origin);
+        assert!(!middle_state.has_items);
+        assert!(middle_state.draw_line);
+        assert!(!middle_state.show_current);
+        assert!(!middle_state.show_origin);
+        assert!(oldest_state.has_items);
+        assert!(oldest_state.draw_line);
+        assert!(!oldest_state.show_current);
+        assert!(oldest_state.show_origin);
+    }
+
+    #[test]
+    fn split_lane_state_extends_open_line_to_global_current_date() {
+        let other_newer = note_at("other-newer", 2026, 6, 3, 10);
+        let target_old = note_at("target-old", 2026, 5, 30, 10);
+        let graph = LineGraphData {
+            lines: vec![
+                test_line(1, "目标事务", vec![target_old]),
+                test_line(2, "其他事务", vec![other_newer]),
+            ],
+            ..LineGraphData::default()
+        };
+        let groups = split_timeline_by_transaction(&graph);
+        let source_key = TimelineSourceKey::Line(Uuid::from_u128(1));
+
+        let current_state = split_lane_state(&groups, source_key, groups[0].date);
+        let origin_state = split_lane_state(&groups, source_key, groups[1].date);
+
+        assert!(!current_state.has_items);
+        assert!(current_state.draw_line);
+        assert!(current_state.show_current);
+        assert!(!current_state.show_origin);
+        assert!(origin_state.has_items);
+        assert!(origin_state.draw_line);
+        assert!(!origin_state.show_current);
+        assert!(origin_state.show_origin);
+    }
+
+    #[test]
+    fn split_timeline_content_width_includes_gutter_gap_and_trailing_padding() {
+        let width = super::split_timeline_content_width(3);
+
+        assert_eq!(
+            width,
+            super::SPLIT_DATE_GUTTER_WIDTH
+                + (3.0 * super::SPLIT_LANE_WIDTH)
+                + (3.0 * super::SPLIT_LANE_GAP)
+                + super::SPLIT_SCROLL_TRAILING_PADDING
+        );
+    }
+
+    #[test]
+    fn merged_timeline_rows_include_current_and_origin_markers() {
+        let record = note_at("record", 2026, 6, 3, 10);
+        let graph = LineGraphData {
+            lines: vec![test_line(1, "事务", vec![record])],
+            ..LineGraphData::default()
+        };
+
+        let rows = merged_timeline_rows(&graph);
+
+        assert!(matches!(rows.first(), Some(TimelineRow::CurrentMarker)));
+        assert!(matches!(rows.last(), Some(TimelineRow::OriginMarker)));
+    }
+
+    #[test]
+    fn empty_graph_has_no_merged_items_or_split_columns() {
+        let graph = LineGraphData::default();
+
+        assert!(merged_timeline_items(&graph).is_empty());
+        assert!(split_timeline_by_transaction(&graph).is_empty());
+    }
+
+    #[test]
+    fn merged_timeline_rows_flatten_date_headers_and_records_for_virtualization() {
+        let older = note_at("older", 2026, 6, 1, 10);
+        let newer = note_at("newer", 2026, 6, 3, 10);
+        let graph = LineGraphData {
+            lines: vec![test_line(1, "事务", vec![older, newer])],
+            ..LineGraphData::default()
+        };
+
+        let rows = merged_timeline_rows(&graph);
+
+        assert!(matches!(rows[0], TimelineRow::CurrentMarker));
+        assert!(matches!(rows[1], TimelineRow::DateHeader { .. }));
+        assert!(matches!(rows[2], TimelineRow::Record(_)));
+        assert!(matches!(rows[3], TimelineRow::DateHeader { .. }));
+        assert!(matches!(rows[4], TimelineRow::Record(_)));
+        assert!(matches!(rows[5], TimelineRow::OriginMarker));
+    }
+
+    #[test]
+    fn timeline_row_sizes_match_rows_and_allow_variable_heights() {
+        let mut long = note_at("long", 2026, 6, 3, 10);
+        long.title = None;
+        long.content =
+            "这是一条比较长的时间线记录，用来验证虚拟列表可以为内容更多的节点分配更高的行高"
+                .to_string();
+        let graph = LineGraphData {
+            lines: vec![test_line(1, "事务", vec![long])],
+            ..LineGraphData::default()
+        };
+        let rows = merged_timeline_rows(&graph);
+
+        let sizes = timeline_row_sizes(&rows);
+
+        assert_eq!(sizes.len(), rows.len());
+        assert!(sizes[1].height < sizes[2].height);
     }
 }
 
@@ -1058,6 +2608,19 @@ fn section_label(text: impl Into<String>) -> Div {
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(0x6b7280))
         .child(text.into())
+}
+
+fn compact_badge(label: impl Into<String>) -> Div {
+    div()
+        .px(px(8.0))
+        .py(px(4.0))
+        .rounded(px(999.0))
+        .bg(rgb(0xecfdf5))
+        .border_1()
+        .border_color(rgb(0xbbf7d0))
+        .text_xs()
+        .text_color(rgb(0x047857))
+        .child(label.into())
 }
 
 fn stat_row(label: impl Into<String>, value: usize) -> Div {

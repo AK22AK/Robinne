@@ -2,20 +2,18 @@
 
 ## 推荐开发流程
 
-从现在开始，推荐使用 `功能分支 -> PR -> main -> tag release` 这条路径，而不是直接把功能提交推到 `main`。
+仓库以 `dev` 作为日常开发主力分支，合入主线走 `dev -> PR -> main` 路径：
 
-日常开发流程：
-
-1. 从 `main` 拉最新代码。
-2. 新建功能分支，例如 `codex/settings-shortcut-fix`。
-3. 在本地开发并完成基础自测。
-4. 推送功能分支并创建 PR，目标分支为 `main`。
-5. 等待 GitHub Actions 常规 CI 通过：
+1. 日常小修小补、常规问题修复和中小特性直接在 `dev` 分支上开发并提交。
+2. 只有需要单独验证或高风险的特殊功能特性，才从 `dev` 切出专门的特性分支，验证通过后再合回 `dev`。
+3. 需要合入主线或准备发版时，推送 `dev` 并创建 PR，目标分支为 `main`。
+4. 等待 GitHub Actions 常规 CI 通过：
    - `Test macOS`
    - `Test Windows`
-6. CI 全绿后再合并到 `main`。
-7. 版本号变更和 release note 也建议走单独 PR。
-8. 只有在 `main` 最新提交已经通过常规 CI 后，才打 `v*.*.*` tag 触发正式发布。
+5. CI 全绿后再合并到 `main`（合并时**保留 `dev` 分支不删除**）。
+6. 版本号变更和 release note（`docs/releases/v<version>.md`）可在发版收口 PR 中随 `dev` 合入，或单独提 PR 合入 `main`。
+7. 只有在 `main` 最新提交已经通过常规 CI 后，才在 `main` 上打 `v*.*.*` annotated tag 触发自动发版。
+8. 发版后将本地 `dev` fast-forward 同步到 `origin/main` 并推送 `dev`，保持两分支基线一致。
 
 如果仍然直接 `push main`：
 
@@ -114,7 +112,7 @@ docs/releases/v<version>.md
 - macOS 可额外生成带 `Applications` 快捷方式的 DMG 安装盘，但在完成 codesign / notarization 前不作为推荐分发方式
 - Windows 提供 `robinne.exe` 的 ZIP 压缩包
 - 自动生成 `SHA256SUMS.txt`
-- Release 由 GitHub Actions 自动创建并直接发布
+- Release 由 GitHub Actions 自动创建并直接公开发布：`0.x` 版本（及带 `-` 预发布后缀的版本）标记为 GitHub **Pre-release**（`draft: false`、`prerelease: true`）；`1.0.0` 及以后正式版本自动取消 Pre-release 标记
 - 当前代码基线以 macOS / Windows 双平台为准，Linux 不在本轮支持范围内
 
 当前版本不包含以下内容：
@@ -130,42 +128,46 @@ docs/releases/v<version>.md
 
 ## 后续发布规划
 
+- [ ] 为 macOS 接入正式 codesign / notarization：复用个人 Developer ID 证书与 App Store Connect API（在 GitHub 仓库配置 `release-signing` 环境及对应 Secrets）并扩展 `build_mac_app.sh` 与 `release.yml`
 - [ ] 支持按架构分别构建和发布产物
 - [ ] macOS 同时提供 `arm64` 和 `x86_64` 版本，或评估合并为 Universal Binary
 - [ ] Windows 先补 `x86_64` 明确命名产物，后续再评估 `arm64`
 - [ ] 在 GitHub Actions 中将 `os + target` 扩展为矩阵构建
 - [ ] 统一产物命名，例如 `Robinne-v0.2.0-macos-arm64.zip`
-- [ ] 为 DMG 增加 codesign / notarization 与更完整的安装盘视觉样式
+- [ ] 为 DMG 增加更完整的安装盘视觉样式
 
 ## 发版步骤
 
-1. 确认目标功能已经通过 PR 合并到 `main`
+1. 确认目标功能已经从 `dev` 通过 PR 合并到 `main`（保留 `dev` 分支不删除）
 2. 确认 `main` 最新提交的常规 CI 已经全绿：
    - `Test macOS`
    - `Test Windows`
-3. 确认 `Cargo.toml` 中 `version` 已更新为目标版本，例如 `0.2.0`
-4. 如有需要，补充 `docs/releases/v0.2.0.md`
+3. 确认 `Cargo.toml` 中 `version` 已更新为目标版本，例如 `0.3.0`
+4. 如有需要，补充 `docs/releases/v0.3.0.md`
 5. 本地执行验证：
 
 ```bash
 cargo test --quiet
 cargo build --release
-./build_mac_app.sh --version 0.2.0
+./build_mac_app.sh --version 0.3.0 --skip-build
 # Windows 打包在 GitHub Actions 的 Windows runner 完成
 ```
 
-6. 创建标签：
+6. 将本地 `dev` fast-forward 同步到 `origin/main` 后，在 `origin/main` 创建 annotated tag 并推送：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git fetch origin
+git merge --ff-only origin/main
+git push origin dev
+git tag -a v0.3.0 origin/main -m "v0.3.0"
+git push origin v0.3.0
 ```
 
 7. 等待 GitHub Actions 中的 `Release` 工作流完成
-8. 打开 GitHub Release 页面，确认附件已生成：
-   - `Robinne-v0.2.0-macos.zip`
-   - `Robinne-v0.2.0-macos.dmg`
-   - `Robinne-v0.2.0-windows.zip`
+8. 打开 GitHub Release 页面，确认已发布为预期类型（`0.x` 为 Pre-release，`1.0+` 为正式版）且附件完整：
+   - `Robinne-v0.3.0-macos.zip`
+   - `Robinne-v0.3.0-macos.dmg`
+   - `Robinne-v0.3.0-windows.zip`
    - `SHA256SUMS.txt`
 9. 优先下载 macOS ZIP 包并验证其中的 `Robinne.app` 可以启动；DMG 仅用于内部验证
 10. 确认发布说明（手写或自动生成）与附件内容正确

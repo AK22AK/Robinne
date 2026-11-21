@@ -1,5 +1,5 @@
 use crate::models::{Priority, Record, TaskStatus};
-use crate::store::Store;
+use crate::store::{Store, StoreEvent};
 use crate::ui::parsing;
 use crate::ui::sidebar::{main_sidebar_layout_mode, main_sidebar_width};
 use crate::ui::style::{ClaudeLikeColors, TaskTypography};
@@ -281,9 +281,35 @@ impl TaskPanel {
             });
         });
 
-        panel.load_tasks(cx);
-        panel.load_available_tags(cx);
+        panel.install_data_change_listener(cx);
+        panel.refresh_data(cx);
         panel
+    }
+
+    pub fn refresh_data(&mut self, cx: &mut Context<Self>) {
+        self.load_tasks(cx);
+        self.load_available_tags(cx);
+    }
+
+    fn install_data_change_listener(&mut self, cx: &mut Context<Self>) {
+        let mut changes = self.store.subscribe_data_changes();
+        cx.spawn(async move |view, cx| loop {
+            match changes.recv().await {
+                Ok(StoreEvent::DataChanged)
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if view
+                        .update(cx, |panel, cx| {
+                            panel.refresh_data(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        })
+        .detach();
     }
 
     pub fn open_task(&mut self, task_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
